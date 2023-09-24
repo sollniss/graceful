@@ -5,11 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 )
 
 var (
-	_ server = &http.Server{}
+	_ server    = &http.Server{}
+	_ tlsserver = &http.Server{}
 )
 
 type server interface {
@@ -17,10 +21,21 @@ type server interface {
 	Shutdown(ctx context.Context) error
 }
 
-// HTTPServer starts server and gracefully shuts it down as soon as ctx is Done.
+type tlsserver interface {
+	ListenAndServeTLS(certFile string, keyFile string) error
+	Shutdown(ctx context.Context) error
+}
+
+// Start enables customizable graceful shutdown.
 //
-// This function is blocking so additional cleanup can be performed after.
-func HTTPServer(ctx context.Context, server server, timeout time.Duration) error {
+// ctx.Done is used to signal a shutdown.
+// start is expected to be blocking (i.e. server.ListenAndServe).
+// success is the error returned by start on successful shutdown (i.e. http.ErrServerClosed).
+// shutdown is the function that initiates a shutdown (i.e. server.Shutdown).
+// timeout specifies the time available for the graceful shutdown. If the timeout is exceeded a context.DeadlineExceeded error is returned.
+//
+// Any error returned by either start or shutdown, that is not success will be wrapped and returned.
+func Start(ctx context.Context, start func() error, success error, shutdown func(context.Context) error, timeout time.Duration) error {
 	shutdownErr := make(chan error, 1)
 	go func() {
 		<-ctx.Done()
@@ -28,11 +43,11 @@ func HTTPServer(ctx context.Context, server server, timeout time.Duration) error
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 
-		shutdownErr <- server.Shutdown(ctx)
+		shutdownErr <- shutdown(ctx)
 	}()
 
-	err := server.ListenAndServe()
-	if !errors.Is(err, http.ErrServerClosed) {
+	err := start()
+	if !errors.Is(err, success) {
 		return fmt.Errorf("graceful: error on ListenAndServe: %w", err)
 	}
 
@@ -43,56 +58,30 @@ func HTTPServer(ctx context.Context, server server, timeout time.Duration) error
 	return nil
 }
 
-/*
-func HTTPServer2(server *http.Server, timeout time.Duration, sig ...os.Signal) error {
-	listenErr := make(chan error, 1)
-	go func() {
-		err := server.ListenAndServe()
-		if !errors.Is(err, http.ErrServerClosed) {
-			listenErr <- fmt.Errorf("graceful: error on ListenAndServe: %s", err)
-		}
-	}()
-
-	if len(sig) == 0 {
-		sig = append(sig, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
-	}
-	stopCh := make(chan os.Signal, 1)
-	signal.Notify(stopCh, sig...)
-	defer close(stopCh)
-
-	<-stopCh
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	if err := server.Shutdown(ctx); err != nil {
-		return fmt.Errorf("graceful: error on Shutdown: %w", err)
-	}
-	return nil
+// ListenAndServe starts server using ListenAndServe and gracefully shuts it down as soon as ctx is Done.
+//
+// This function is blocking so additional cleanup can be performed after.
+func ListenAndServe(ctx context.Context, server server, timeout time.Duration) error {
+	return Start(ctx, server.ListenAndServe, http.ErrServerClosed, server.Shutdown, timeout)
 }
 
-func ShutdownHandler(start func() error, shutdown func(context.Context) error, timeout time.Duration, sig ...os.Signal) error {
-	go func() {
-		err := start()
-		if err != nil {
-			fmt.Printf("graceful: error on start: %s", err)
-		} else {
-			fmt.Printf("graceful: shutdown ok")
-		}
-	}()
-
-	stopCh := make(chan os.Signal, 1)
-	signal.Notify(stopCh, sig...)
-	defer close(stopCh)
-	<-stopCh
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	err := shutdown(ctx)
-	if err != nil {
-		return fmt.Errorf("graceful: error on shutdown: %w", err)
+// ListenAndServeTLS starts server using ListenAndServeTLS and gracefully shuts it down as soon as ctx is Done.
+//
+// This function is blocking so additional cleanup can be performed after.
+func ListenAndServeTLS(ctx context.Context, server tlsserver, certFile string, keyFile string, timeout time.Duration) error {
+	start := func() error {
+		return server.ListenAndServeTLS(certFile, keyFile)
 	}
-	return nil
+
+	return Start(ctx, start, http.ErrServerClosed, server.Shutdown, timeout)
 }
-*/
+
+// NotifyShutdown is a utility function that calls
+//
+//	signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+//
+// and returns the context only.
+func NotifyShutdown() context.Context {
+	ctx, _ := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+	return ctx
+}
